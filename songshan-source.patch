@@ -1,0 +1,8 @@
+--- a/xmake.lua
++++ b/xmake.lua
+@@ -1,4 +1,4 @@
+-add_requires("pybind11")
++add_requires("pybind11 2.13.6")
+ 
+ set_toolchains("gcc")
+ 
