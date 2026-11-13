@@ -1,0 +1,11 @@
+--- a/python/infinicore/tensor.py
++++ b/python/infinicore/tensor.py
+@@ -198,6 +198,7 @@
+-        _infinicore.from_blob(
++        _infinicore.strided_from_blob(
+             torch_tensor.data_ptr(),
+             list(torch_tensor.shape),
++            strides=list(torch_tensor.stride()),
+             dtype=infini_type._underlying,
+             device=infini_device._underlying,
+         ),

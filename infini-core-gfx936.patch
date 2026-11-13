@@ -1,0 +1,366 @@
+--- a/xmake.lua
++++ b/xmake.lua
+@@ -1,6 +1,6 @@
+ add_rules("mode.debug", "mode.release")
+ add_requires("boost", {configs = {stacktrace = true}})
+-add_requires("pybind11")
++add_requires("pybind11 2.13.6")
+ 
+ -- Define color codes
+ local GREEN = '\27[0;32m'
+--- a/xmake/hygon.lua
++++ b/xmake/hygon.lua
+@@ -29,10 +29,7 @@
+         return
+     end
+ 
+-    local include_dirs = {
+-        path.join(dtk_root, "include"),
+-        path.join(dtk_root, "cuda", "include"),
+-    }
++    local include_dirs = {}
+     local link_dirs = {
+         path.join(dtk_root, "lib"),
+         path.join(dtk_root, "cuda", "lib64"),
+@@ -222,7 +219,7 @@
+ 
+         -- 添加海光DCU特定的编译标志
+         -- 检测实际GPU架构，如果未指定则默认使用gfx906
+-        local hygon_arch = os.getenv("HYGON_ARCH") or "gfx906"
++        local hygon_arch = HYGON_ARCH
+         add_cuflags("-arch=" .. hygon_arch)
+ 
+         -- 使用NCCL (NVIDIA Collective Communications Library)
+--- a/src/infiniop/ops/timestep_embedding/nvidia/timestep_embedding_nvidia.cu
++++ b/src/infiniop/ops/timestep_embedding/nvidia/timestep_embedding_nvidia.cu
+@@ -3,6 +3,9 @@
+ #include "../../../devices/nvidia/nvidia_common.cuh"
+ #include "../../../devices/nvidia/nvidia_kernel_common.cuh"
+ #include "../../../tensor.h"
++#ifdef ENABLE_HYGON_API
++#include "../ninetoothed/bridge.h"
++#endif
+ 
+ #include <cmath>
+ #include <cuda_runtime.h>
+@@ -88,6 +91,16 @@
+         return INFINI_STATUS_SUCCESS;
+     }
+ 
++#ifdef ENABLE_HYGON_API
++    const char *nt_mode = std::getenv("INFINI_TIMESTEP_NT");
++    if (device_type == INFINI_DEVICE_HYGON
++        && nt_mode && std::strcmp(nt_mode, "1") == 0) {
++        return timestep_nt::run(
++            output, timestep, _num_timesteps, _embedding_dim,
++            _input_dtype, max_period, stream);
++    }
++#endif
++
+     constexpr size_t block_size = 256;
+     const size_t grid_size = (numel + block_size - 1) / block_size;
+     const float log_max_period = std::log(max_period);
+--- /dev/null
++++ b/src/infiniop/ops/timestep_embedding/ninetoothed/bridge.h
+@@ -0,0 +1,131 @@
++#pragma once
++
++#include "ninetoothed.h"
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <dlfcn.h>
++#include <map>
++#include <mutex>
++#include <string>
++
++namespace timestep_nt {
++
++using Launch = NineToothedResult (*)(
++    NineToothedStream,
++    NineToothedTensor,
++    NineToothedTensor,
++    NineToothedTensor,
++    NineToothedTensor);
++
++struct Entry {
++    void *library;
++    Launch launch;
++};
++
++inline infiniStatus_t run(
++    void *output,
++    const void *timestep,
++    size_t count,
++    size_t dim,
++    infiniDtype_t dtype,
++    float max_period,
++    void *stream) {
++
++    if (dim != 16 && dim != 256) {
++        return INFINI_STATUS_NOT_IMPLEMENTED;
++    }
++
++    const char *label = nullptr;
++    switch (dtype) {
++    case INFINI_DTYPE_F16: label = "fp16"; break;
++    case INFINI_DTYPE_BF16: label = "bf16"; break;
++    case INFINI_DTYPE_F32: label = "fp32"; break;
++    default: return INFINI_STATUS_BAD_TENSOR_DTYPE;
++    }
++
++    const char *root = std::getenv("INFINI_TIMESTEP_NT_ROOT");
++    if (!root || !*root) {
++        std::fprintf(stderr, "INFINI_TIMESTEP_NT_ROOT is not set\n");
++        return INFINI_STATUS_INTERNAL_ERROR;
++    }
++
++    std::string directory;
++    std::string name;
++    if (dim == 256 && dtype == INFINI_DTYPE_F32) {
++        directory = "aot_d256_fp32";
++        name = "nt_timestep_aot_d256_fp32";
++    } else {
++        directory = "aot_generic_d" + std::to_string(dim) + "_" + label;
++        name = "nt_timestep_generic_d" + std::to_string(dim) + "_" + label;
++    }
++
++    const std::string path =
++        std::string(root) + "/" + directory + "/" + name + ".so";
++
++    static std::mutex mutex;
++    static std::map<std::string, Entry> libraries;
++    Launch launch = nullptr;
++
++    {
++        std::lock_guard<std::mutex> lock(mutex);
++        auto found = libraries.find(path);
++        if (found == libraries.end()) {
++            void *library = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
++            if (!library) {
++                std::fprintf(stderr, "NineToothed dlopen: %s\n", dlerror());
++                return INFINI_STATUS_INTERNAL_ERROR;
++            }
++
++            dlerror();
++            auto function = reinterpret_cast<Launch>(
++                dlsym(library, ("launch_" + name).c_str()));
++            const char *error = dlerror();
++            if (error || !function) {
++                std::fprintf(stderr, "NineToothed dlsym: %s\n",
++                             error ? error : "null symbol");
++                dlclose(library);
++                return INFINI_STATUS_INTERNAL_ERROR;
++            }
++
++            found = libraries.emplace(path, Entry{library, function}).first;
++            if (std::getenv("INFINI_TIMESTEP_NT_TRACE")) {
++                std::fprintf(stderr,
++                    "[NineToothed timestep] loaded %s\n", path.c_str());
++            }
++        }
++        launch = found->second.launch;
++    }
++
++    uint64_t input_shape[] = {static_cast<uint64_t>(count)};
++    int64_t input_strides[] = {1};
++
++    uint64_t output_shape[] = {
++        static_cast<uint64_t>(count),
++        static_cast<uint64_t>(dim / 2)};
++    int64_t output_strides[] = {static_cast<int64_t>(dim), 1};
++
++    // 当前九齿 AOT 标量接口使用宿主侧 double 参数缓冲。
++    double period_value = static_cast<double>(max_period);
++
++    NineToothedTensor input{
++        const_cast<void *>(timestep), input_shape, input_strides};
++    NineToothedTensor period{&period_value, nullptr, nullptr};
++    NineToothedTensor cos_output{
++        output, output_shape, output_strides};
++    NineToothedTensor sin_output{
++        static_cast<float *>(output) + dim / 2,
++        output_shape, output_strides};
++
++    const auto result =
++        launch(stream, input, period, cos_output, sin_output);
++
++    if (result != 0) {
++        std::fprintf(stderr, "NineToothed launch failed: %d\n",
++                     static_cast<int>(result));
++        return INFINI_STATUS_INTERNAL_ERROR;
++    }
++    return INFINI_STATUS_SUCCESS;
++}
++
++} // namespace timestep_nt
+--- /dev/null
++++ b/src/infiniop/ops/timestep_embedding/ninetoothed/ninetoothed.h
+@@ -0,0 +1,167 @@
++#ifndef NINETOOTHED_H
++#define NINETOOTHED_H
++
++#include <stdint.h>
++
++#define NINETOOTHED_TRUE 1
++
++#define NINETOOTHED_FALSE 0
++
++#define NINETOOTHED_NONE 0
++
++enum NineToothedDataType {
++    NINETOOTHED_INT8,
++    NINETOOTHED_INT16,
++    NINETOOTHED_INT32,
++    NINETOOTHED_INT64,
++    NINETOOTHED_UINT8,
++    NINETOOTHED_UINT16,
++    NINETOOTHED_UINT32,
++    NINETOOTHED_UINT64,
++    NINETOOTHED_FLOAT16,
++    NINETOOTHED_BFLOAT16,
++    NINETOOTHED_FLOAT32,
++    NINETOOTHED_FLOAT64
++};
++
++typedef struct {
++    void *data;
++    uint64_t *shape;
++    int64_t *strides;
++} NineToothedTensor;
++
++typedef void *NineToothedStream;
++
++typedef int NineToothedResult;
++
++#ifdef __cplusplus
++#include <filesystem>
++#include <fstream>
++#include <map>
++#include <sstream>
++#include <string>
++#include <vector>
++
++namespace ninetoothed {
++
++class AutoTuningCache {
++public:
++    AutoTuningCache(const std::string& path) : path{path} {}
++
++    std::vector<int> lookup(const std::vector<int>& config) {
++        load();
++
++        auto iter = cache.find(config);
++
++        if (iter != cache.end()) {
++            return iter->second;
++        }
++
++        return default_meta;
++    }
++
++private:
++    void load() {
++        auto mtime = std::filesystem::last_write_time(path);
++
++        if (mtime == last_mtime) {
++            return;
++        }
++
++        last_mtime = mtime;
++
++        cache.clear();
++
++        std::ifstream file{path};
++        std::string config_line;
++        std::string meta_line;
++
++        if (std::getline(file, config_line) && std::getline(file, meta_line)) {
++            default_meta = parse(meta_line);
++        }
++
++        while (std::getline(file, config_line) && std::getline(file, meta_line)) {
++            cache[parse(config_line)] = parse(meta_line);
++        }
++    }
++
++    static std::vector<int> parse(const std::string& line) {
++        std::vector<int> values;
++        std::stringstream ss{line};
++        std::string token;
++
++        while (std::getline(ss, token, ',')) {
++            auto trimmed = trim(token);
++
++            if (!trimmed.empty()) {
++                values.push_back(std::stoi(trimmed));
++            }
++        }
++
++        return values;
++    }
++
++    static std::string trim(const std::string& s) {
++        auto start = s.find_first_not_of(" \t\r\n");
++
++        if (start == std::string::npos) {
++            return "";
++        }
++
++        auto end = s.find_last_not_of(" \t\r\n");
++
++        return s.substr(start, end - start + 1);
++    }
++
++    std::string path;
++
++    std::map<std::vector<int>, std::vector<int>> cache;
++
++    std::vector<int> default_meta;
++
++    std::filesystem::file_time_type last_mtime;
++};
++
++}
++
++#include <mutex>
++#include <shared_mutex>
++#include <unordered_map>
++
++namespace ninetoothed {
++
++template<typename Key, typename Value>
++class ThreadSafeUnorderedMap {
++public:
++    Value& operator[](const Key& key) {
++        {
++            std::shared_lock lock{mutex};
++
++            auto iter = map.find(key);
++
++            if (iter != map.end()) {
++                return iter->second;
++            }
++        }
++
++        std::unique_lock lock{mutex};
++
++        auto iter = map.find(key);
++
++        if (iter == map.end()) {
++            iter = map.emplace(key, Value{}).first;
++        }
++
++        return iter->second;
++    }
++
++private:
++    std::unordered_map<Key, Value> map;
++
++    mutable std::shared_mutex mutex;
++};
++
++}
++#endif
++
++#endif // NINETOOTHED_H

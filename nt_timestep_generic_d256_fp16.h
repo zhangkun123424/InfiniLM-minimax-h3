@@ -1,0 +1,12 @@
+#ifndef NINETOOTHED_NT_TIMESTEP_GENERIC_D256_FP16_H
+#define NINETOOTHED_NT_TIMESTEP_GENERIC_D256_FP16_H
+
+#include "ninetoothed.h"
+
+#ifdef __cplusplus
+extern "C" NineToothedResult launch_nt_timestep_generic_d256_fp16(NineToothedStream stream, NineToothedTensor ninetoothed_tensor_42, NineToothedTensor ninetoothed_tensor_43, NineToothedTensor ninetoothed_tensor_44, NineToothedTensor ninetoothed_tensor_45);
+#else
+NineToothedResult launch_nt_timestep_generic_d256_fp16(NineToothedStream stream, NineToothedTensor ninetoothed_tensor_42, NineToothedTensor ninetoothed_tensor_43, NineToothedTensor ninetoothed_tensor_44, NineToothedTensor ninetoothed_tensor_45);
+#endif
+
+#endif

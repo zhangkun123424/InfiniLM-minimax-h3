@@ -1,0 +1,12 @@
+#ifndef NINETOOTHED_NT_TIMESTEP_AOT_D256_FP32_H
+#define NINETOOTHED_NT_TIMESTEP_AOT_D256_FP32_H
+
+#include "ninetoothed.h"
+
+#ifdef __cplusplus
+extern "C" NineToothedResult launch_nt_timestep_aot_d256_fp32(NineToothedStream stream, NineToothedTensor ninetoothed_tensor_70, NineToothedTensor ninetoothed_tensor_71, NineToothedTensor ninetoothed_tensor_72, NineToothedTensor ninetoothed_tensor_73);
+#else
+NineToothedResult launch_nt_timestep_aot_d256_fp32(NineToothedStream stream, NineToothedTensor ninetoothed_tensor_70, NineToothedTensor ninetoothed_tensor_71, NineToothedTensor ninetoothed_tensor_72, NineToothedTensor ninetoothed_tensor_73);
+#endif
+
+#endif
